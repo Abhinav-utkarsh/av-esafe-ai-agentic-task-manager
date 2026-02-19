@@ -491,8 +491,7 @@ function renderTasks() {
         const item = document.createElement('div');
         
         let css = `
-            background: rgba(255, 255, 255, 0.6);
-            border: 1px solid rgba(255, 255, 255, 0.8);
+            background: rgba(255, 255, 255, 0.45);
             border-radius: 12px;
             padding: 1rem;
             margin-bottom: 1rem;
@@ -504,9 +503,8 @@ function renderTasks() {
         `;
         
         if (isCompleted) {
-            css += `opacity: 0.75; background: rgba(240, 240, 240, 0.4); border-color: transparent;`;
+            css += `opacity: 0.75; background: rgba(240, 240, 240, 0.3); border-color: transparent;`;
         }
-
         item.style.cssText = css;
         
         // Content Container
@@ -723,7 +721,7 @@ async function optimizeTasks() {
     if (!key) return;
 
     const tasks = JSON.parse(localStorage.getItem(key) || '[]');
-    if (tasks.length === 0) return alert("Please add tasks before optimizing.");
+    if (tasks.length === 0) return showToast("Please add tasks before optimizing.", "error");
 
     // -- UI Loading State & Prevent Rapid Clicks --
     const optimizeButton = document.querySelector('.btn-optimize');
@@ -753,29 +751,30 @@ async function optimizeTasks() {
     renderTasks();
 
     // -- Call AI Backend --
-    optimizeButton.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Optimizing...';
+    optimizeButton.innerHTML = '<i class="fa-solid fa-brain fa-spin"></i> AI Processing...';
 
     // --- UI Loading State ---
     const loader = document.getElementById('ai-loading');
     loader.classList.remove('hidden');
 
+    // Filter active tasks to reduce payload
+    const activeTasksPayload = tasks.filter(t => t.status === 'active');
+
     try {
         const response = await fetch('/optimize', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-
-
-
-
-
             body: JSON.stringify({
                 department: localStorage.getItem('currentDepartment'),
                 subDepartment: localStorage.getItem('currentSubDepartment'),
-                tasks: tasks
+                tasks: activeTasksPayload
             })
         });
 
-        if (!response.ok) throw new Error('Optimization failed');
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || 'Optimization failed');
+        }
 
         const data = await response.json();
 
@@ -793,7 +792,7 @@ async function optimizeTasks() {
 
     } catch (error) {
         console.error(error);
-        alert("AI Optimization failed. Please try again.");
+        showToast(`AI Optimization failed: ${error.message}`, "error");
     } finally {
         // Restore button state
         optimizeButton.innerHTML = originalText;
@@ -965,17 +964,40 @@ function exportReportPDF() {
     const dept = localStorage.getItem('currentDepartment') || 'General';
     const sub = localStorage.getItem('currentSubDepartment') || 'Tasks';
     const key = `${dept}-${sub}`;
-    const tasks = JSON.parse(localStorage.getItem(key) || '[]');
+    let tasks = JSON.parse(localStorage.getItem(key) || '[]');
     
-    // Get AI Summary if available
+    // --- Merge AI Data (Optimization Cache) ---
     const cacheKey = `${key}_optimized`;
     let summary = null;
     try {
         const cachedData = JSON.parse(localStorage.getItem(cacheKey));
-        if (cachedData && cachedData.summary) {
-            summary = cachedData.summary;
+        if (cachedData) {
+            if (cachedData.summary) summary = cachedData.summary;
+            
+            // Merge AI fields
+            const taskMap = new Map(tasks.map(t => [String(t.id), t]));
+            const reordered = [];
+
+            if (cachedData.reorderedTasks) {
+                cachedData.reorderedTasks.forEach(optTask => {
+                    const original = taskMap.get(String(optTask.id));
+                    if (original) {
+                        original.priority = optTask.priority;
+                        original.reason = optTask.reason;
+                        original.confidence = optTask.confidence;
+                        reordered.push(original);
+                        taskMap.delete(String(optTask.id));
+                    }
+                });
+            }
+            // Add remaining
+            taskMap.forEach(t => reordered.push(t));
+            tasks = reordered;
         }
-    } catch (e) { console.error("Summary parse error", e); }
+    } catch (e) { console.error("Summary/Merge parse error", e); }
+
+    // --- Apply Filters (Respect UI State) ---
+    tasks = applyFiltersAndSort(tasks);
 
     // --- PDF Configuration ---
     const pageWidth = doc.internal.pageSize.getWidth();
@@ -1046,25 +1068,49 @@ function exportReportPDF() {
     doc.text("Task Priority Report", margin, y);
     y += 10;
 
+    // Filter info
+    const statusFilter = document.getElementById('filter-status')?.value || 'all';
+    if (statusFilter !== 'all') {
+        doc.setFont("helvetica", "italic");
+        doc.setFontSize(9);
+        doc.setTextColor(100);
+        doc.text(`(Filtered by Status: ${statusFilter})`, margin + 50, y - 10);
+    }
+
     if (tasks.length === 0) {
         doc.setFont("helvetica", "italic");
         doc.setFontSize(10);
         doc.setTextColor(100);
-        doc.text("No active tasks to report.", margin, y);
+        doc.text("No tasks match the current filters.", margin, y);
     } else {
         tasks.forEach((task) => {
-            // Calculate Risk Label manually
+            // Use shared calculateRisk function for consistency
             let riskLabel = "Stable";
+            let riskColor = [22, 163, 74]; // Green
+
+            // 1. Calculate Date-based Risk (Default)
             if (task.deadline) {
-                const today = new Date(); today.setHours(0,0,0,0);
-                const [dy, dm, dd] = task.deadline.split('-').map(Number);
-                const target = new Date(dy, dm - 1, dd);
-                const diffDays = Math.ceil((target - today) / (1000 * 60 * 60 * 24));
+                const risk = calculateRisk(task.deadline);
+                if (risk) {
+                    // Remove emojis for PDF compatibility
+                    riskLabel = risk.label.split('•')[0].replace(/[^\w\s]/gi, '').trim();
+                    
+                    if (risk.category === "Overdue" || risk.category === "High Urgency") {
+                        riskColor = [220, 38, 38]; // Red
+                    } else if (risk.category === "Moderate Urgency") {
+                        riskColor = [234, 88, 12]; // Orange
+                    }
+                }
+            }
+
+            // 2. Override with AI Priority if available
+            if (task.priority) {
+                riskLabel = task.priority;
                 
-                if (diffDays < 0) riskLabel = "OVERDUE";
-                else if (diffDays === 0) riskLabel = "Due Today";
-                else if (diffDays <= 2) riskLabel = "High Risk";
-                else if (diffDays <= 5) riskLabel = "Moderate Risk";
+                if (task.priority === 'Critical') riskColor = [220, 38, 38]; // Red
+                else if (task.priority === 'High') riskColor = [234, 88, 12]; // Orange
+                else if (task.priority === 'Medium') riskColor = [202, 138, 4]; // Dark Yellow
+                else riskColor = [22, 163, 74]; // Green
             }
 
             // Prepare Data
@@ -1072,10 +1118,12 @@ function exportReportPDF() {
             const confidence = task.confidence ? `${task.confidence}%` : "N/A";
             const title = task.title || "Untitled Task";
             const desc = task.description || "No description provided.";
+            const reason = task.reason ? `AI Insight: ${task.reason}` : "";
             
             // Estimate height
             const descLines = doc.splitTextToSize(desc, contentWidth - 5);
-            const blockHeight = 20 + (descLines.length * 4);
+            const reasonLines = reason ? doc.splitTextToSize(reason, contentWidth - 5) : [];
+            const blockHeight = 25 + (descLines.length * 4) + (reasonLines.length * 4);
 
             checkPageBreak(blockHeight);
 
@@ -1097,9 +1145,7 @@ function exportReportPDF() {
             doc.text(`Confidence: ${confidence}`, margin + 80, metaY);
             
             // Risk Color
-            if (riskLabel.includes("OVERDUE") || riskLabel.includes("High")) doc.setTextColor(220, 38, 38);
-            else if (riskLabel.includes("Moderate")) doc.setTextColor(234, 88, 12);
-            else doc.setTextColor(22, 163, 74);
+            doc.setTextColor(riskColor[0], riskColor[1], riskColor[2]);
             
             doc.text(`Risk: ${riskLabel}`, margin + 120, metaY);
 
@@ -1108,8 +1154,18 @@ function exportReportPDF() {
             doc.setFont("helvetica", "normal");
             doc.setTextColor(100);
             doc.text(descLines, margin + 2, y);
+            y += (descLines.length * 4);
+
+            // AI Reason
+            if (reasonLines.length > 0) {
+                y += 2;
+                doc.setFont("helvetica", "italic");
+                doc.setTextColor(124, 58, 237); // Purple for AI
+                doc.text(reasonLines, margin + 2, y);
+                y += (reasonLines.length * 4);
+            }
             
-            y += (descLines.length * 4) + 4;
+            y += 4;
             
             // Divider
             doc.setDrawColor(240);
@@ -1121,4 +1177,217 @@ function exportReportPDF() {
     // --- Save ---
     const filename = `Av_eSAFE_Report_${dept}_${sub}_${new Date().toISOString().split('T')[0]}.pdf`;
     doc.save(filename);
+}
+
+/* =========================================
+   UI Helpers (Toast & Loading)
+   ========================================= */
+
+function showToast(message, type = 'info') {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    
+    let icon = '<i class="fa-solid fa-circle-info" style="color: #7c3aed;"></i>';
+    if (type === 'success') icon = '<i class="fa-solid fa-circle-check" style="color: #10b981;"></i>';
+    if (type === 'error') icon = '<i class="fa-solid fa-circle-exclamation" style="color: #ef4444;"></i>';
+
+    toast.innerHTML = `${icon} <span style="font-weight: 500; color: #334155;">${message}</span>`;
+    container.appendChild(toast);
+
+    // Remove after 4 seconds
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(20px)';
+        setTimeout(() => toast.remove(), 300);
+    }, 4000);
+}
+
+function showLoadingPopup(message, subtext = null, iconType = 'spinner') {
+    const modal = document.getElementById('loading-modal');
+    const text = document.getElementById('loading-text');
+    const subtextEl = document.getElementById('loading-subtext');
+    const iconWrapper = document.getElementById('loading-icon-wrapper');
+
+    if (modal && text && iconWrapper) {
+        text.textContent = message;
+        
+        if (subtext) {
+            subtextEl.textContent = subtext;
+            subtextEl.style.display = 'block';
+        } else {
+            subtextEl.style.display = 'none';
+        }
+
+        if (iconType === 'brain') {
+            iconWrapper.innerHTML = '<i class="fa-solid fa-brain fa-spin" style="font-size: 3rem; color: #7c3aed;"></i>';
+        } else {
+            iconWrapper.innerHTML = '<div class="spinner" style="width: 50px; height: 50px; border: 4px solid #f3f3f3; border-top: 4px solid #7c3aed; border-radius: 50%; animation: spin 1s linear infinite;"></div>';
+        }
+
+        modal.classList.remove('hidden');
+    }
+}
+
+function hideLoadingPopup() {
+    const modal = document.getElementById('loading-modal');
+    if (modal) modal.classList.add('hidden');
+}
+
+/* =========================================
+   File Import & Parsing Logic
+   ========================================= */
+
+async function handleFileUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const fileName = file.name;
+    const fileExt = fileName.split('.').pop().toLowerCase();
+
+    // Show loading popup
+    showLoadingPopup("Reading document...");
+    
+    try {
+        let extractedText = "";
+
+        if (fileExt === 'xlsx' || fileExt === 'xls') {
+            extractedText = await parseExcel(file);
+        } else if (fileExt === 'docx') {
+            extractedText = await parseWord(file);
+        } else if (fileExt === 'pdf') {
+            extractedText = await parsePDF(file);
+        } else {
+            showToast("Unsupported file format. Please upload .xlsx, .docx, or .pdf", "error");
+            hideLoadingPopup();
+            return;
+        }
+
+        if (extractedText.trim().length > 0) {
+            showLoadingPopup("Analyzing your tasks with AI...", "It might take few mins please wait", "brain");
+            await analyzeTextAndCreateTasks(extractedText);
+        } else {
+            showToast("Could not extract any text from the document.", "error");
+            hideLoadingPopup();
+        }
+
+    } catch (error) {
+        console.error("Error parsing file:", error);
+        showToast("Failed to read the file.", "error");
+        hideLoadingPopup();
+    } finally {
+        // Reset input and button
+        event.target.value = ''; 
+    }
+}
+
+// --- Excel Parser (SheetJS) ---
+function parseExcel(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            try {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array' });
+                
+                let textResults = [];
+                workbook.SheetNames.forEach(sheetName => {
+                    const worksheet = workbook.Sheets[sheetName];
+                    const json = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+                    const sheetText = json.map(row => row.join(" ")).join("\n");
+                    textResults.push(`Sheet: ${sheetName}\n${sheetText}`);
+                });
+                
+                resolve(textResults.join("\n\n"));
+            } catch (err) {
+                reject(err);
+            }
+        };
+        reader.onerror = reject;
+        reader.readAsArrayBuffer(file);
+    });
+}
+
+// --- Word Parser (Mammoth) ---
+function parseWord(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const arrayBuffer = e.target.result;
+            mammoth.extractRawText({ arrayBuffer: arrayBuffer })
+                .then(result => resolve(result.value))
+                .catch(reject);
+        };
+        reader.onerror = reject;
+        reader.readAsArrayBuffer(file);
+    });
+}
+
+// --- PDF Parser (PDF.js) ---
+async function parsePDF(file) {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    
+    let fullText = "";
+    
+    for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageText = textContent.items.map(item => item.str).join(" ");
+        fullText += `Page ${i}:\n${pageText}\n\n`;
+    }
+    
+    return fullText;
+}
+
+// --- AI Integration ---
+async function analyzeTextAndCreateTasks(text) {
+    try {
+        const response = await fetch('/parse-tasks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: text })
+        });
+
+        if (!response.ok) throw new Error('AI Parsing failed');
+
+        const data = await response.json();
+        
+        if (data.tasks && Array.isArray(data.tasks)) {
+            const key = getStorageKey();
+            if (!key) return;
+            
+            const currentTasks = JSON.parse(localStorage.getItem(key) || '[]');
+            
+            let addedCount = 0;
+            data.tasks.forEach(t => {
+                const newTask = {
+                    id: Date.now() + Math.floor(Math.random() * 1000),
+                    title: t.title,
+                    description: t.description || '',
+                    deadline: t.deadline || '',
+                    status: 'active'
+                };
+                currentTasks.push(newTask);
+                addedCount++;
+            });
+            
+            localStorage.setItem(key, JSON.stringify(currentTasks));
+            localStorage.removeItem(`${key}_optimized`); // Clear cache
+            renderTasks();
+            
+            hideLoadingPopup();
+            showToast(`Successfully imported ${addedCount} tasks.`, "success");
+        } else {
+            hideLoadingPopup();
+            showToast("AI could not identify any tasks.", "error");
+        }
+
+    } catch (error) {
+        console.error("AI Task Extraction Error:", error);
+        hideLoadingPopup();
+        showToast(`Failed to analyze document: ${error.message}`, "error");
+    }
 }

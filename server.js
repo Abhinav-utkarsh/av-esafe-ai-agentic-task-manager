@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 require("dotenv").config();
 
 // Safe fetch for all Node versions
@@ -13,8 +14,9 @@ try {
 const app = express();
 
 app.use(cors());
-app.use(express.json());
-app.use(express.static("public"));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.static(path.join(__dirname, "public")));
+app.use("/image", express.static(path.join(__dirname, "image")));
 
 console.log("Loaded OpenRouter Key:", process.env.OPENROUTER_API_KEY);
 
@@ -40,7 +42,8 @@ app.post("/optimize", async (req, res) => {
     }
 
     // ✅ Only active tasks
-    const activeTasks = tasks.filter(t => t.status === "active");
+    // Limit to 50 tasks to prevent token overflow/timeouts with large imports
+    const activeTasks = tasks.filter(t => t.status === "active").slice(0, 50);
 
     if (activeTasks.length === 0) {
       return res.status(400).json({
@@ -94,6 +97,7 @@ app.post("/optimize", async (req, res) => {
 
       return {
         id: task.id,
+        title: (task.title || "").substring(0, 50), // Include title for context, truncated
         daysRemaining,
         urgencyCategory,
         cleanDeadlineLabel
@@ -104,34 +108,32 @@ app.post("/optimize", async (req, res) => {
     const prompt = `
 You are an AI Task Optimization Engine.
 
-Follow these strict priority rules:
-
+Analyze the tasks.
+Priority Rules:
 Overdue = Critical
 Due Today = High
-High Urgency = High
-Moderate Urgency = Medium
-Stable Timeline = Low
+1-3 Days Left = High
+4-7 Days Left = Medium
+>7 Days = Low
+No deadline = Low
 
-Do not override rules.
-Do not recalculate deadlines.
-Do not mention task titles.
-Return valid JSON only.
+Return strictly valid JSON.
+IMPORTANT: You must include EVERY task from the input list in the output JSON, even if priority is Low. Do not skip any tasks.
 
 Tasks:
 ${JSON.stringify(tasksWithContext)}
 
-Return exactly:
-
+JSON Structure:
 {
   "reorderedTasks": [
     {
       "id": "task_id",
       "priority": "Critical/High/Medium/Low",
       "confidence": 85,
-      "reason": "Short professional explanation referencing urgencyCategory."
+      "reason": "Max 5 words."
     }
   ],
-  "summary": "4 to 6 sentence professional executive summary without mentioning task names."
+  "summary": "Max 2 sentences executive summary."
 }
 `;
 
@@ -144,7 +146,7 @@ Return exactly:
       body: JSON.stringify({
         model: "mistralai/mistral-7b-instruct",
         temperature: 0.1,
-        max_tokens: 800,
+        max_tokens: 4000,
         messages: [{ role: "user", content: prompt }]
       })
     });
@@ -179,38 +181,59 @@ Return exactly:
         parsed.summary = parsed.summary.replace(/[*`]/g, '');
     }
 
-    // ===== STRICT PRIORITY ENFORCEMENT (BACKEND OVERRIDE) =====
-    // Create a lookup map for urgency categories from the calculated context
+    // ===== STRICT PRIORITY ENFORCEMENT & MISSING TASK FILL =====
     const urgencyMap = new Map();
     tasksWithContext.forEach(t => {
         urgencyMap.set(String(t.id), t.urgencyCategory);
     });
 
-    if (parsed.reorderedTasks && Array.isArray(parsed.reorderedTasks)) {
-        parsed.reorderedTasks.forEach(task => {
-            // Sanitize reason
-            if (task.reason) {
-                task.reason = task.reason.replace(/[*`]/g, '');
-            }
-
-            // Enforce Priority Rules
-            const category = urgencyMap.get(String(task.id));
-            
-            if (category) {
-                if (category === "Overdue") {
-                    task.priority = "Critical";
-                } else if (category === "Due Today") {
-                    task.priority = "High";
-                } else if (category === "High Urgency") { // 1-3 days remaining
-                    task.priority = "High";
-                } else if (category === "Moderate Urgency") {
-                    task.priority = "Medium";
-                } else if (category === "Stable Timeline") {
-                    task.priority = "Low";
-                }
-            }
-        });
+    // Ensure reorderedTasks exists
+    if (!parsed.reorderedTasks || !Array.isArray(parsed.reorderedTasks)) {
+        parsed.reorderedTasks = [];
     }
+
+    const processedIds = new Set();
+
+    // 1. Process returned tasks
+    parsed.reorderedTasks.forEach(task => {
+        processedIds.add(String(task.id));
+
+        // Sanitize reason
+        if (task.reason) task.reason = task.reason.replace(/[*`]/g, '');
+
+        // Enforce Priority Rules
+        const category = urgencyMap.get(String(task.id));
+        if (category) {
+            if (category === "Overdue") task.priority = "Critical";
+            else if (category === "Due Today") task.priority = "High";
+            else if (category === "High Urgency") task.priority = "High";
+            else if (category === "Moderate Urgency") task.priority = "Medium";
+            else if (category === "Stable Timeline") task.priority = "Low";
+            else if (category === "No deadline") task.priority = "Low";
+        }
+    });
+
+    // 2. Add missing tasks (Fallbacks for tasks AI skipped)
+    tasksWithContext.forEach(t => {
+        if (!processedIds.has(String(t.id))) {
+            let priority = "Low";
+            let reason = "Timeline is stable.";
+            
+            if (t.urgencyCategory === "Overdue") { priority = "Critical"; reason = "Task is overdue."; }
+            else if (t.urgencyCategory === "Due Today") { priority = "High"; reason = "Due today."; }
+            else if (t.urgencyCategory === "High Urgency") { priority = "High"; reason = "Approaching deadline."; }
+            else if (t.urgencyCategory === "Moderate Urgency") { priority = "Medium"; reason = "Upcoming deadline."; }
+            else if (t.urgencyCategory === "Stable Timeline") { priority = "Low"; reason = "Timeline is stable."; }
+            else if (t.urgencyCategory === "No deadline") { priority = "Low"; reason = "No deadline set."; }
+
+            parsed.reorderedTasks.push({
+                id: t.id,
+                priority: priority,
+                confidence: 90, // High confidence because it's rule-based
+                reason: reason
+            });
+        }
+    });
     // =============================================
 
     res.json(parsed);
@@ -223,6 +246,62 @@ Return exactly:
       error: "Optimization failed",
       details: error.message
     });
+  }
+});
+
+app.post("/parse-tasks", async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: "Text required" });
+
+    if (!process.env.OPENROUTER_API_KEY) {
+      return res.status(500).json({ error: "API Key missing" });
+    }
+
+    const prompt = `
+You are an AI Task Extractor.
+Analyze the following document text and extract actionable tasks.
+
+Return a strict JSON object with a "tasks" key containing an array of objects.
+Each object must have:
+- title: (string) Clear task name
+- description: (string) Brief details
+- deadline: (string) YYYY-MM-DD format if mentioned, else null
+
+Text to analyze:
+${text.substring(0, 15000)} 
+`;
+
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + process.env.OPENROUTER_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "mistralai/mistral-7b-instruct",
+        temperature: 0.1,
+        max_tokens: 4000,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || "AI Error");
+
+    let aiText = data.choices?.[0]?.message?.content || "";
+    aiText = aiText.replace(/```json/g, "").replace(/```/g, "").trim();
+    
+    const start = aiText.indexOf("{");
+    const end = aiText.lastIndexOf("}");
+    if (start === -1 || end === -1) throw new Error("Invalid JSON from AI");
+    
+    const json = JSON.parse(aiText.substring(start, end + 1));
+    res.json(json);
+
+  } catch (error) {
+    console.error("Parse Tasks Error:", error);
+    res.status(500).json({ error: "Failed to parse tasks" });
   }
 });
 

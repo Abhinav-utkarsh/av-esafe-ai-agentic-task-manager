@@ -18,6 +18,51 @@
 
     <!-- PDF Export Libraries -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <!-- File Parsing Libraries (Excel, Word, PDF) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // Initialize PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            background-image: url('/image/background.jpg') !important;
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            background-repeat: no-repeat;
+        }
+
+        /* Toast & Modal Styles */
+        .toast {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(10px);
+            padding: 1rem 1.5rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 300px;
+            border-left: 5px solid #7c3aed;
+            animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+        .toast.error { border-left-color: #ef4444; }
+        .toast.success { border-left-color: #10b981; }
+        .toast i { font-size: 1.2rem; }
+        
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
 </head>
 <body>
 
@@ -108,6 +153,11 @@
             <header class="dashboard-header">
                 <h2 id="session-title">Session Active</h2>
                 <div class="header-actions" style="display: flex; gap: 1rem;">
+                    <!-- File Upload Input (Hidden) & Trigger Button -->
+                    <input type="file" id="import-file-input" accept=".xlsx, .xls, .docx, .pdf" style="display: none;" onchange="handleFileUpload(event)">
+                    <button class="btn-text" onclick="document.getElementById('import-file-input').click()">
+                        <i class="fa-solid fa-file-import"></i> Import Tasks
+                    </button>
                     <button class="btn-text btn-export-pdf" onclick="exportReportPDF()"><i class="fa-solid fa-file-pdf"></i> Export Report</button>
                     <button class="btn-text" onclick="location.reload()">End Session</button>
                 </div>
@@ -219,6 +269,20 @@
             </div>
         </div>
     </div>
+
+    <!-- Loading Modal -->
+    <div id="loading-modal" class="modal-overlay hidden" style="z-index: 9999;">
+        <div class="modal-content" style="text-align: center; max-width: 320px; padding: 2rem;">
+            <div id="loading-icon-wrapper" style="margin-bottom: 1.5rem; display: flex; justify-content: center;">
+                <div class="spinner" style="width: 50px; height: 50px; border: 4px solid #f3f3f3; border-top: 4px solid #7c3aed; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+            </div>
+            <h3 id="loading-text" style="margin: 0; color: var(--text-dark); font-size: 1.2rem;">Processing...</h3>
+            <p id="loading-subtext" style="margin-top: 0.5rem; color: #64748b; font-size: 0.9rem; display: none;"></p>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" style="position: fixed; bottom: 30px; right: 30px; z-index: 10000; display: flex; flex-direction: column; gap: 15px;"></div>
 
     <footer class="app-footer">
         <p>&copy; 2026 Av_eSAFE | AI Agentic Task Manager</p>
